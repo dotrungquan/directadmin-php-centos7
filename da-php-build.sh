@@ -1294,7 +1294,7 @@ build_php() {
         else
             log "Nếu OLS đang chạy lsphp$s cũ: systemctl restart lsws (hoặc chạy lại với RESTART=1)"
         fi
-        log "Lưu ý: cấu hình OLS do 'build rewrite_confs' của DirectAdmin sinh ra; script này không sửa nó."
+        log "Lệnh php chỉ build runtime. Chạy integrate để DirectAdmin/OLS sinh extProcessor/vhost và xác minh request thật."
     fi
     if [ "$INSTALL_EXTENSIONS" = 1 ]; then
         commit_extension_transaction
@@ -1395,6 +1395,7 @@ capture_rewrite_inventory() {  # output-list0
     fi
     [ -d /etc/httpd/conf ] && webroots+=(/etc/httpd/conf)
     [ -d /etc/nginx ] && webroots+=(/etc/nginx)
+    [ -d /usr/local/lsws/conf ] && webroots+=(/usr/local/lsws/conf)
     [ "${#webroots[@]}" -gt 0 ] || return 1
     find "${webroots[@]}" \( -type f -o -type l -o -type d \) -print0 >>"$out" 2>/dev/null \
         || return 1
@@ -1508,6 +1509,7 @@ backup_integration_scope() {  # suffix
     scope_backup "$DA_CB/build"
     scope_backup "$DA_CB/custom_versions.txt"
     scope_backup "/usr/local/directadmin/data/admin/services.status"
+    scope_backup "/usr/local/bin/lsphp"
     capture_rewrite_inventory "$INTEGRATION_PRE_REWRITE_LIST" \
         || die "Không tạo được inventory trước rewrite_confs"
     snapshot_rewrite_inventory "$INTEGRATION_PRE_REWRITE_LIST"
@@ -1519,6 +1521,7 @@ backup_integration_scope() {  # suffix
     list="$INTEGRATION_TX_DIR/webserver-files.list0"
     [ -d /etc/httpd/conf ] && webroots+=(/etc/httpd/conf)
     [ -d /etc/nginx ] && webroots+=(/etc/nginx)
+    [ -d /usr/local/lsws/conf ] && webroots+=(/usr/local/lsws/conf)
     [ "${#webroots[@]}" -gt 0 ] || die "Không tìm thấy thư mục cấu hình webserver"
     find "${webroots[@]}" -type f -print0 >"$list" 2>/dev/null \
         || die "Không inventory được cấu hình webserver"
@@ -1556,7 +1559,7 @@ finish_integration_mutation() {
 }
 
 rollback_integration() {
-    local q kind path rel entry service state enabled failed=0 tx_state meta mode uid gid atime mtime context
+    local q kind path rel entry service state enabled current_enabled failed=0 tx_state meta mode uid gid atime mtime context
     if [ ! -s "$INTEGRATION_TX_DIR/scope.sha256" ] || \
        ! sha256sum -c "$INTEGRATION_TX_DIR/scope.sha256" >/dev/null 2>&1; then
         warn "Integration scope thiếu hoặc sai checksum; từ chối rollback không đầy đủ: $INTEGRATION_TX_DIR"
@@ -1670,9 +1673,36 @@ rollback_integration() {
             systemctl stop "$service" >/dev/null 2>&1 || { warn "Không trả $service về trạng thái $state"; failed=1; }
         fi
         case "$enabled" in
-            enabled) systemctl enable "$service" >/dev/null 2>&1 || { warn "Không enable lại được $service"; failed=1; } ;;
-            disabled) systemctl disable "$service" >/dev/null 2>&1 || { warn "Không disable lại được $service"; failed=1; } ;;
-            masked) systemctl mask "$service" >/dev/null 2>&1 || { warn "Không mask lại được $service"; failed=1; } ;;
+            enabled)
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                if [ "$current_enabled" != enabled ]; then
+                    systemctl enable "$service" >/dev/null 2>&1 \
+                        || { warn "Không enable lại được $service"; failed=1; }
+                fi
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                [ "$current_enabled" = enabled ] \
+                    || { warn "$service chưa trở lại enabled (đang là ${current_enabled:-unknown})"; failed=1; }
+                ;;
+            disabled)
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                if [ "$current_enabled" != disabled ]; then
+                    systemctl disable "$service" >/dev/null 2>&1 \
+                        || { warn "Không disable lại được $service"; failed=1; }
+                fi
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                [ "$current_enabled" = disabled ] \
+                    || { warn "$service chưa trở lại disabled (đang là ${current_enabled:-unknown})"; failed=1; }
+                ;;
+            masked)
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                if [ "$current_enabled" != masked ]; then
+                    systemctl mask "$service" >/dev/null 2>&1 \
+                        || { warn "Không mask lại được $service"; failed=1; }
+                fi
+                current_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+                [ "$current_enabled" = masked ] \
+                    || { warn "$service chưa trở lại masked (đang là ${current_enabled:-unknown})"; failed=1; }
+                ;;
             static|indirect|generated|not-found) ;;
             *) warn "Trạng thái enable rollback không hợp lệ: $service=$enabled"; failed=1 ;;
         esac
@@ -1713,12 +1743,12 @@ restore_parallel_units_after_rewrite() {
         cp -a "$snap" "$unit" || return 1
         log "Khôi phục unit $(basename "$unit") sau CustomBuild rewrite"
     done <"$list"
-    systemctl daemon-reload
+    systemctl daemon-reload || return 1
     for entry in $INTEGRATION_SERVICE_STATES; do
         IFS=: read -r service state enabled <<<"$entry"
         case "$service:$state" in
             php-fpm*:active)
-                systemctl is-active --quiet "$service" 2>/dev/null || systemctl start "$service"
+                systemctl is-active --quiet "$service" 2>/dev/null || systemctl start "$service" || return 1
                 ;;
             php-fpm*:*)
                 if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -1763,8 +1793,32 @@ restore_parallel_configs_after_rewrite() {  # target suffix
     fi
 }
 
-ensure_custombuild_branch_support() {  # branch
-    local v=$1 s=${1/./} P=$PHP_PREFIX_ROOT/php${1/./}
+restore_parallel_configs_after_ols_rewrite() {
+    local base snap rel dest q status
+    base="$INTEGRATION_TX_DIR/snapshot"
+    q="$INTEGRATION_TX_DIR/post-rewrite-overwritten"
+    for snap in "$base"/usr/local/php*/etc/php-fpm.conf; do
+        [ -f "$snap" ] || continue
+        rel=${snap#"$base"/}; dest="/$rel"
+        mkdir -p "$q/$(dirname "$rel")" "$(dirname "$dest")"
+        if [ -e "$dest" ] || [ -L "$dest" ]; then mv "$dest" "$q/$rel" || return 1; fi
+        cp -a "$snap" "$dest" || return 1
+        record_change "restore-parallel-fpm-config-after-ols" "$dest"
+    done
+    status=/usr/local/directadmin/data/admin/services.status
+    snap="$base/${status#/}"
+    if [ -f "$snap" ]; then
+        mkdir -p "$q/$(dirname "${status#/}")" "$(dirname "$status")"
+        if [ -e "$status" ] || [ -L "$status" ]; then
+            mv "$status" "$q/${status#/}" || return 1
+        fi
+        cp -a "$snap" "$status" || return 1
+        record_change "restore-services-status-after-ols" "restored exact pre-rewrite file"
+    fi
+}
+
+ensure_custombuild_branch_support() {  # branch [php-fpm|lsphp]
+    local v=$1 integration_mode=${2:-php-fpm} s=${1/./} P=$PHP_PREFIX_ROOT/php${1/./}
     local build="$DA_CB/build" line count tmp template_src template_dst custom_versions metadata
     line=$(grep -m1 '^PHP1_RELEASE_SET=' "$build" 2>/dev/null || true)
     [ -n "$line" ] || die "Không tìm thấy PHP1_RELEASE_SET trong $build"
@@ -1816,6 +1870,8 @@ ensure_custombuild_branch_support() {  # branch
         record_change "custombuild-version-metadata" "branch=$v metadata=$metadata transaction=$INTEGRATION_TX_DIR"
         log "Đã ghim metadata source PHP ${PHPV[$v]} cho CustomBuild cũ"
     fi
+
+    [ "$integration_mode" = php-fpm ] || return 0
 
     # fpmChecks() của CustomBuild cũ sẽ copy file này khi rewrite_confs.
     template_src="$P/etc/php-fpm.conf"
@@ -1993,6 +2049,97 @@ vhost_domain_maps_socket() {  # apache|nginx file domain socket
     ' "$file"
 }
 
+ols_extprocessor_maps_binary() {  # config suffix expected-binary
+    local file=$1 suffix=$2 expected=$3
+    awk -v wanted="lsphp$suffix" -v expected="$expected" '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        {
+            line=$0; sub(/[[:space:]]*#.*/, "", line); line=trim(line)
+            if (!inside && line ~ "^extProcessor[[:space:]]+" wanted "[[:space:]]*\\{") {
+                inside=1; depth=0; sections++
+            }
+            if (inside) {
+                work=line; opens=gsub(/\{/, "{", work); closes=gsub(/\}/, "}", work); depth+=opens-closes
+                if (line ~ /^type[[:space:]]+/) {
+                    value=line; sub(/^type[[:space:]]+/, "", value); value=trim(value)
+                    types++
+                    if (value == "lsapi") type_matched=1
+                }
+                if (line ~ /^path[[:space:]]+/) {
+                    value=line; sub(/^path[[:space:]]+/, "", value); value=trim(value)
+                    paths++
+                    if (value == expected) matched=1
+                }
+                if (depth <= 0) inside=0
+            }
+        }
+        END { exit !(sections == 1 && types == 1 && type_matched && paths == 1 && matched) }
+    ' "$file"
+}
+
+ols_config_test() {  # optional tester path (tests only); production uses OpenLiteSpeed binary
+    local tester=${1:-/usr/local/lsws/bin/openlitespeed} output rc
+    [ -x "$tester" ] || { warn "Không chạy được OpenLiteSpeed config tester: $tester"; return 1; }
+    output=$("$tester" -t 2>&1)
+    rc=$?
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+    grep -Fq '[ERROR]' <<<"$output" && return 1
+    case "$rc" in
+        0) return 0 ;;
+        1)
+            # OpenLiteSpeed 1.7.x/CentOS 7 trả 1 khi cấu hình hợp lệ nhưng có
+            # warning (ví dụ optional include rỗng). Chỉ chấp nhận rc=1 khi
+            # output được phân loại rõ là WARN và tuyệt đối không có ERROR.
+            grep -Fq '[WARN]' <<<"$output"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+ols_vhost_maps_handler() {  # user-openlitespeed.conf domain suffix
+    local file=$1 domain=$2 suffix=$3
+    awk -v wanted_domain="$domain" -v wanted_handler="lsapi:lsphp$suffix" '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        function exact_domain(line, n, token, i) {
+            gsub(/[;,]/, " ", line)
+            n=split(line, token, /[[:space:]]+/)
+            for (i=1; i<=n; i++) if (tolower(token[i]) == tolower(wanted_domain)) return 1
+            return 0
+        }
+        {
+            line=$0; sub(/[[:space:]]*#.*/, "", line); line=trim(line)
+            if (!inside && line ~ /^virtualHost[[:space:]]+/ && line ~ /\{[[:space:]]*$/) {
+                inside=1; depth=0; has_domain=0; has_handler=0
+            }
+            if (inside) {
+                work=line; opens=gsub(/\{/, "{", work); closes=gsub(/\}/, "}", work); depth+=opens-closes
+                if (line ~ /^vhDomain[[:space:]]+/ && exact_domain(line)) has_domain=1
+                if (line ~ /^scripthandler[[:space:]]*\{[[:space:]]*$/) {
+                    in_scripthandler=1; scripthandler_depth=depth
+                } else if (in_scripthandler) {
+                    token_count=split(line, handler_token, /[[:space:]]+/)
+                    if (token_count == 3 && handler_token[1] == "add" && \
+                        handler_token[2] == wanted_handler && handler_token[3] == "php") has_handler=1
+                }
+                if (in_scripthandler && depth < scripthandler_depth) in_scripthandler=0
+                if (depth <= 0) {
+                    if (has_domain && has_handler) found=1
+                    inside=0
+                }
+            }
+        }
+        END { exit !found }
+    ' "$file"
+}
+
 set_domain_slot() {  # file slot
     local file=$1 slot=$2 tmp="$1.dabuild.$$"
     awk -F= -v slot="$slot" '
@@ -2006,8 +2153,50 @@ set_domain_slot() {  # file slot
     mv -f "$tmp" "$file"
 }
 
-verify_domain_php_runtime() {  # user domain suffix expected-version
-    local user=$1 domain=$2 s=$3 expected=$4 docroot probe output uid evidence
+ensure_ols_primary_binary() {  # php1 release [main-lsphp-path]
+    local release=$1 main=${2:-/usr/local/bin/lsphp} suffix=${1/./}
+    local target="$PHP_PREFIX_ROOT/php${suffix}/bin/lsphp" resolved retained
+    [ -x "$target" ] || die "Thiếu lsphp chính cho PHP $release: $target"
+    resolved=$(readlink -f "$target")
+    [ "$resolved" = "$PHP_PREFIX_ROOT/php${suffix}/bin/lsphp${suffix}" ] \
+        || die "$target không trỏ đúng lsphp${suffix}: $resolved"
+    if [ -e "$main" ] || [ -L "$main" ]; then
+        [ ! -d "$main" ] || die "Đường dẫn lsphp chính không được là thư mục: $main"
+        [ "$(readlink -f "$main" 2>/dev/null || true)" != "$resolved" ] || return 0
+        retained="$INTEGRATION_TX_DIR/primary-lsphp.before"
+        [ ! -e "$retained" ] && [ ! -L "$retained" ] \
+            || die "Đã có evidence lsphp chính trong transaction: $retained"
+        mv "$main" "$retained" || die "Không giữ lại lsphp chính cũ: $main"
+    fi
+    ln -s "$target" "$main" || die "Không publish được lsphp chính: $main"
+    [ "$(readlink -f "$main")" = "$resolved" ] \
+        || die "lsphp chính không resolve tới PHP $release sau publication"
+    durable_barrier || die "Không flush được publication lsphp chính"
+}
+
+domain_origin_ipv4() {  # DirectAdmin domain.conf
+    local file=$1 origin_ip octet
+    origin_ip=$(kv_get "$file" ip) || return 1
+    [[ "$origin_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    local IFS=.
+    local -a parts=()
+    read -r -a parts <<<"$origin_ip"
+    [ "${#parts[@]}" -eq 4 ] || return 1
+    for octet in "${parts[@]}"; do
+        [ -n "$octet" ] || return 1
+        [ "${#octet}" -le 3 ] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+    printf '%s\n' "$origin_ip"
+}
+
+verify_domain_php_runtime() {  # user domain suffix expected-version expected-sapi
+    local user=$1 domain=$2 s=$3 expected=$4 expected_sapi=${5:-fpm-fcgi} docroot probe output uid evidence
+    local domain_conf origin_ip
+    domain_conf="/usr/local/directadmin/data/users/$user/domains/$domain.conf"
+    [ -f "$domain_conf" ] || die "Không thấy cấu hình domain DirectAdmin: $domain_conf"
+    origin_ip=$(domain_origin_ipv4 "$domain_conf") \
+        || die "Không xác định được một IPv4 origin duy nhất từ $domain_conf"
     docroot="/home/$user/domains/$domain/public_html"
     [ -d "$docroot" ] || die "Không thấy document root chuẩn của $domain: $docroot"
     probe="$docroot/dabuild-check-$s-$$-${RANDOM}.php"
@@ -2017,15 +2206,18 @@ verify_domain_php_runtime() {  # user domain suffix expected-version
     chmod 0644 "$probe"
     chown --reference="$docroot" "$probe"
     uid=$(id -u "$user")
-    if ! output=$(curl -kfsS --resolve "$domain:443:127.0.0.1" --max-time 20 "https://$domain/$(basename "$probe")"); then
+    if ! output=$(curl -kfsS --noproxy '*' --resolve "$domain:443:$origin_ip" --max-time 20 "https://$domain/$(basename "$probe")"); then
         evidence="$INTEGRATION_TX_DIR/http-probes/failed-$user-$domain.php"
         mkdir -p "$(dirname "$evidence")"; mv "$probe" "$evidence" 2>/dev/null || true
         die "Origin HTTPS/PHP probe của $domain thất bại"
     fi
     evidence="$INTEGRATION_TX_DIR/http-probes/passed-$user-$domain.php"
     mkdir -p "$(dirname "$evidence")"; mv "$probe" "$evidence" || die "Không thu hồi được PHP probe khỏi webroot"
-    [ "$output" = "$expected|fpm-fcgi|$uid" ] \
-        || die "PHP probe $domain trả '$output', cần '$expected|fpm-fcgi|$uid'"
+    case "$expected_sapi:$output" in
+        fpm-fcgi:"$expected|fpm-fcgi|$uid") ;;
+        litespeed:"$expected|litespeed|$uid"|litespeed:"$expected|openlitespeed|$uid") ;;
+        *) die "PHP probe $domain trả '$output', cần PHP $expected / SAPI $expected_sapi / UID $uid" ;;
+    esac
     record_change "request-proof-php$s" "user=$user domain=$domain result=$output"
 }
 
@@ -2208,6 +2400,164 @@ integrate_fpm() {  # branch slot USER DOMAIN [USER DOMAIN ...]
     log "DirectAdmin integration PHP $v: OK (slot $slot, ${#domains[@]} domain)"
 }
 
+integrate_ols() {  # branch slot USER DOMAIN [USER DOMAIN ...]
+    local v=${1:-} slot=${2:-}
+    shift 2 2>/dev/null || true
+    local s P old_release old_mode webserver user domain domain_conf f selected pair i
+    local service state enabled load_state release mode ext_conf vhost_conf binary resolved output
+    local primary_release primary_mode expected_processor suffix
+    local -a users=() domains=() affected=()
+    local -A requested=() state_seen=()
+
+    [ -n "${PHPV[$v]:-}" ] || die "Dùng: $0 integrate 8.5 4 USER DOMAIN [USER DOMAIN ...]"
+    case "$slot" in 2|3|4) ;; *) die "Chỉ được dùng slot phụ 2, 3 hoặc 4; không tự thay PHP chính." ;; esac
+    [ "$#" -ge 2 ] && [ $(( $# % 2 )) -eq 0 ] || die "Cần truyền từng cặp USER DOMAIN."
+    prepare_dirs
+    acquire_integration_lock
+    while [ "$#" -gt 0 ]; do
+        user=$1; domain=$2; shift 2
+        [[ "$user" =~ ^[a-zA-Z0-9_-]+$ ]] || die "User DirectAdmin không hợp lệ: $user"
+        [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || die "Domain không hợp lệ: $domain"
+        domain_conf="/usr/local/directadmin/data/users/$user/domains/$domain.conf"
+        [ -f "$domain_conf" ] || die "Không thấy cấu hình domain: $domain_conf"
+        users+=("$user"); domains+=("$domain"); requested["$user/$domain"]=1
+    done
+    [ -x "$DA_CB/build" ] || die "Không thấy $DA_CB/build"
+    [ -r "$DA_OPTIONS" ] || die "Không đọc được $DA_OPTIONS"
+    s=${v/./}; P=/usr/local/php$s; binary="$P/bin/lsphp"
+    [ -x "$binary" ] || die "Chưa có binary lsphp PHP $v tại $binary"
+    resolved=$(readlink -f "$binary")
+    [ "$resolved" = "$P/bin/lsphp$s" ] \
+        || die "$binary không trỏ chính xác tới $P/bin/lsphp$s (đang là $resolved)"
+    old_release=$(get_da_option "php${slot}_release")
+    old_mode=$(get_da_option "php${slot}_mode")
+    if [ "$old_release" != "$v" ] || [ "$old_mode" != lsphp ]; then
+        for f in /usr/local/directadmin/data/users/*/domains/*.conf; do
+            [ -f "$f" ] || continue
+            selected=$(kv_get "$f" php1_select)
+            [ "$selected" = "$slot" ] || continue
+            user=${f#/usr/local/directadmin/data/users/}; user=${user%%/*}
+            domain=$(basename "$f" .conf)
+            affected+=("$user/$domain")
+        done
+        [ "$FORCE_SLOT" = 1 ] \
+            || die "php$slot đang là PHP $old_release mode ${old_mode:-unknown}; domain ảnh hưởng: ${affected[*]:-(không có)}. Cần FORCE_SLOT=1."
+        for pair in "${affected[@]+"${affected[@]}"}"; do
+            [ -n "${requested[$pair]:-}" ] \
+                || die "Từ chối đổi slot $slot: domain $pair đang dùng PHP $old_release/${old_mode:-unknown} nhưng không có trong danh sách xác nhận."
+        done
+    fi
+    webserver=$(get_da_option webserver)
+    case "$webserver" in openlitespeed|litespeed) ;; *) die "OpenLiteSpeed integration không phù hợp webserver=$webserver" ;; esac
+
+    backup_integration_scope "$s"
+    INTEGRATION_SERVICE_STATES=""
+    : >"$INTEGRATION_TX_DIR/services.tsv"
+    for service in lsws directadmin php-fpm82 php-fpm83 php-fpm84 php-fpm85; do state_seen[$service]=1; done
+    for service in "${!state_seen[@]}"; do
+        load_state=$(systemctl_property "$service" LoadState) \
+            || die "Không đọc được LoadState chính xác của $service"
+        if [ "$load_state" = not-found ]; then
+            state=not-found; enabled=not-found
+        else
+            [ "$load_state" = loaded ] || die "LoadState $service không an toàn để transaction: $load_state"
+            state=$(systemctl_property "$service" ActiveState) \
+                || die "Không đọc được ActiveState chính xác của $service"
+            enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+            case "$state" in active|inactive) ;; *) die "Trạng thái $service không an toàn để transaction: $state" ;; esac
+            case "$enabled" in enabled|disabled|masked|static|indirect|generated) ;;
+                *) die "Trạng thái enable của $service không hỗ trợ rollback chính xác: $enabled" ;;
+            esac
+        fi
+        INTEGRATION_SERVICE_STATES="$INTEGRATION_SERVICE_STATES $service:$state:$enabled"
+        printf '%s\t%s\t%s\n' "$service" "$state" "$enabled" >>"$INTEGRATION_TX_DIR/services.tsv"
+    done
+    arm_integration_mutation
+    record_change "integrate-lsphp$s" "planned slot=$slot domains=${domains[*]} old_release=$old_release old_mode=$old_mode transaction=$INTEGRATION_TX_DIR"
+
+    # CustomBuild kiểm tra toàn bộ slot trước rewrite; backport metadata cho mọi
+    # branch đang được khai báo, không chỉ slot canary.
+    for i in 1 2 3 4; do
+        release=$(get_da_option "php${i}_release")
+        mode=$(get_da_option "php${i}_mode")
+        [ "$release" != no ] || continue
+        [ -n "${PHPV[$release]:-}" ] || continue
+        ensure_custombuild_branch_support "$release" lsphp
+        [ "$mode" = lsphp ] || warn "php$i đang mode=$mode trong lúc OpenLiteSpeed rewrite"
+    done
+    ensure_custombuild_branch_support "$v" lsphp
+    run "đặt php${slot}_release=$v" "$DA_CB/build" set "php${slot}_release" "$v"
+    run "đặt php${slot}_mode=lsphp" "$DA_CB/build" set "php${slot}_mode" lsphp
+    for i in "${!users[@]}"; do
+        set_domain_slot "/usr/local/directadmin/data/users/${users[$i]}/domains/${domains[$i]}.conf" "$slot"
+    done
+    primary_release=$(get_da_option php1_release)
+    primary_mode=$(get_da_option php1_mode)
+    [ "$primary_mode" = lsphp ] || die "OpenLiteSpeed yêu cầu php1_mode=lsphp, đang là $primary_mode"
+    [ -n "${PHPV[$primary_release]:-}" ] \
+        || die "Không quản lý được PHP chính $primary_release để publish /usr/local/bin/lsphp"
+    ensure_ols_primary_binary "$primary_release"
+    run_rewrite_confs_transactional
+    restore_parallel_units_after_rewrite || die "Không khôi phục được unit song song sau OpenLiteSpeed rewrite"
+    restore_parallel_configs_after_ols_rewrite \
+        || die "Không khôi phục được FPM config/services.status song song sau OpenLiteSpeed rewrite"
+
+    [ "$(get_da_option "php${slot}_release")" = "$v" ] || die "php${slot}_release không còn là $v sau rewrite"
+    [ "$(get_da_option "php${slot}_mode")" = lsphp ] || die "php${slot}_mode không còn là lsphp sau rewrite"
+    ext_conf=/usr/local/lsws/conf/httpd-extprocessors.conf
+    [ -s "$ext_conf" ] || die "OpenLiteSpeed không sinh $ext_conf"
+    for i in 1 2 3 4; do
+        release=$(get_da_option "php${i}_release")
+        mode=$(get_da_option "php${i}_mode")
+        [ "$release" != no ] || continue
+        [ "$mode" = lsphp ] || continue
+        [ -n "${PHPV[$release]:-}" ] || continue
+        suffix=${release/./}
+        if [ "$i" -eq 1 ]; then
+            expected_processor=/usr/local/bin/lsphp
+        else
+            expected_processor="$PHP_PREFIX_ROOT/php${suffix}/bin/lsphp"
+        fi
+        ols_extprocessor_maps_binary "$ext_conf" "$suffix" "$expected_processor" \
+            || die "extProcessor lsphp$suffix không trỏ chính xác tới $expected_processor"
+        [ "$(readlink -f "$expected_processor")" = "$PHP_PREFIX_ROOT/php${suffix}/bin/lsphp${suffix}" ] \
+            || die "$expected_processor không resolve đúng lsphp${suffix}"
+    done
+    "$P/bin/lsphp$s" -v 2>&1 | grep -Fq "PHP ${PHPV[$v]} (litespeed)" \
+        || die "Binary lsphp$s không xác minh được PHP ${PHPV[$v]} / LiteSpeed SAPI"
+    ols_config_test || die "OpenLiteSpeed config test thất bại"
+    systemctl restart lsws || die "Restart lsws thất bại"
+    systemctl is-active --quiet lsws || die "lsws không active sau restart"
+
+    for i in "${!users[@]}"; do
+        user=${users[$i]}; domain=${domains[$i]}
+        [ "$(kv_get "/usr/local/directadmin/data/users/$user/domains/$domain.conf" php1_select)" = "$slot" ] \
+            || die "Selector $domain không bền sau rewrite"
+        vhost_conf="/usr/local/directadmin/data/users/$user/openlitespeed.conf"
+        [ -s "$vhost_conf" ] || die "Thiếu OpenLiteSpeed vhost config: $vhost_conf"
+        ols_vhost_maps_handler "$vhost_conf" "$domain" "$s" \
+            || die "Vhost OpenLiteSpeed $domain chưa map chính xác tới lsphp$s"
+        verify_domain_php_runtime "$user" "$domain" "$s" "${PHPV[$v]}" litespeed
+        record_change "integrate-lsphp$s" "verified slot=$slot user=$user domain=$domain extprocessor=lsphp$s request-php=${PHPV[$v]}"
+    done
+    finish_integration_mutation
+    durable_barrier || die "Không flush được OpenLiteSpeed integration trước commit"
+    durable_set_state "$INTEGRATION_TX_DIR/state" COMMITTED || die "Không ghi durable integration commit"
+    INTEGRATION_ACTIVE=0
+    log "DirectAdmin/OpenLiteSpeed integration PHP $v: OK (slot $slot, ${#domains[@]} domain)"
+}
+
+integrate_directadmin() {
+    local webserver
+    [ -r "$DA_OPTIONS" ] || die "Không đọc được $DA_OPTIONS"
+    webserver=$(get_da_option webserver)
+    case "$webserver" in
+        apache|nginx|nginx_apache) integrate_fpm "$@" ;;
+        openlitespeed|litespeed) integrate_ols "$@" ;;
+        *) die "Webserver không hỗ trợ integrate: $webserver" ;;
+    esac
+}
+
 recover_transaction() {  # transaction-directory
     local tx=${1:-} resolved root service state enabled
     [ -n "$tx" ] || die "Dùng: $0 recover TRANSACTION_DIRECTORY"
@@ -2305,7 +2655,7 @@ main() {
             local v; for v in "$@"; do build_php "$v"; done
             log "Hoàn tất runtime. Để website dùng PHP mới, chạy lệnh integrate với slot phụ + user + domain." ;;
         extensions) extensions_cmd "$@" ;;
-        integrate) preflight; integrate_fpm "$@" ;;
+        integrate) preflight; integrate_directadmin "$@" ;;
         recover) prepare_dirs; recover_transaction "$@" ;;
         pack)   prepare_dirs; acquire_integration_lock; pack ;;
         unpack) prepare_dirs; acquire_integration_lock; unpack "$@" ;;
