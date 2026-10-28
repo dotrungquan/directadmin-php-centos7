@@ -1,37 +1,48 @@
 # DirectAdmin Legacy PHP Builder
 
-Script Bash build **PHP 8.2, 8.3, 8.4 và 8.5 từ source** trên **CentOS 7 + DirectAdmin 1.62.x**.
+Script build và tích hợp **PHP 8.2–8.5 từ source** trên **CentOS 7 + DirectAdmin 1.62.x**.
 
-PHP được cài song song vào `/usr/local/phpXX`, không thay PHP chính của hệ thống. Dependency dùng chung được cài tại `/opt/dabuild`.
+Mục tiêu chính là giúp máy chủ DirectAdmin cũ nâng cấp lên các nhánh PHP mới hơn, qua đó **hỗ trợ khắc phục các lỗ hổng bảo mật đã được vá trong những bản PHP cập nhật**.
+
+Tham khảo: [PHP sắp phát hành bản vá hai lỗ hổng Critical CVSS 9.2](https://dotrungquan.info/php-sap-phat-hanh-ban-va-hai-lo-hong-critical-cvss-9-2/)
 
 > [!CAUTION]
 > ## LƯU Ý: BACKUP TRƯỚC KHI THỰC HIỆN
 >
-> Hãy tạo **snapshot VPS** hoặc bản backup có thể khôi phục trước khi build, rebuild hay tích hợp PHP.
->
-> Script có transaction và rollback, nhưng vẫn thay đổi PHP runtime, systemd unit, CustomBuild, PHP-FPM và cấu hình webserver. Website đang sử dụng phiên bản PHP được rebuild có thể gián đoạn ngắn.
+> Hãy tạo snapshot VPS hoặc bản backup có thể khôi phục. Quá trình build và tích hợp có thể làm website gián đoạn ngắn.
 
-## Chức năng
+## Hỗ trợ
 
-- Build PHP `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12`.
-- Tự nhận diện Apache, Nginx, `nginx_apache`, LiteSpeed và OpenLiteSpeed.
+| Webserver | Handler |
+|---|---|
+| Apache | PHP-FPM |
+| Nginx | PHP-FPM |
+| `nginx_apache` | PHP-FPM |
+| OpenLiteSpeed | LSPHP/LSAPI |
+| LiteSpeed Enterprise | LSPHP/LSAPI |
+
+Script tự nhận diện webserver trong DirectAdmin và chọn đúng chế độ build.
+
+## Phiên bản
+
+```text
+PHP:     8.2.35, 8.3.36, 8.4.27, 8.5.12
+Redis:   6.3.0
+Imagick: 3.8.1
+```
+
+PHP được cài song song tại `/usr/local/phpXX`, không tự động thay PHP cho toàn bộ account.
+
+## Chức năng chính
+
 - Build PHP-FPM, LSPHP hoặc cả hai.
-- Build dependency riêng gồm OpenSSL 1.1.1w, ICU 57.1 và các thư viện cần thiết.
-- Cài Redis `6.3.0` và Imagick `3.8.1` theo đúng PHP ABI.
-- Kiểm tra SHA-256 của source trước khi build.
-- Rebuild runtime bằng transaction và tự rollback nếu thất bại.
-- Tích hợp PHP vào slot phụ của DirectAdmin 1.62.x.
-- Tạo pool và socket PHP-FPM riêng cho từng user.
-- Không tạo pool dùng chung `[webapps]` hoặc `webapps.sock`.
-- Kiểm tra PHP, extension, FPM, socket, vhost và request thật sau integration.
-
-## Yêu cầu
-
-- CentOS 7 x86_64.
-- DirectAdmin 1.62.x và CustomBuild 2.
-- Quyền `root`.
-- Khuyến nghị còn ít nhất 8 GB dung lượng trống.
-- Nên chạy trong `screen` hoặc `tmux`.
+- Build Redis và Imagick theo đúng PHP ABI.
+- Kiểm tra SHA-256 của source.
+- Tích hợp PHP vào slot phụ của DirectAdmin.
+- Tạo pool/socket PHP-FPM riêng cho từng user.
+- Sinh cấu hình OpenLiteSpeed extProcessor/vhost.
+- Transaction và rollback khi build hoặc integration thất bại.
+- Xác minh runtime, service, socket, vhost và request HTTP thật.
 
 ## Cài đặt
 
@@ -46,9 +57,9 @@ curl -fsSL \
 chmod 750 da-php-build.sh
 ```
 
-Hãy tải script xuống và kiểm tra trước khi chạy. Không dùng `curl ... | bash`.
+> Không dùng `curl ... | bash`. Hãy tải và kiểm tra script trước khi chạy.
 
-## Hướng dẫn sử dụng
+## Cách sử dụng
 
 ### 1. Kiểm tra server
 
@@ -58,32 +69,19 @@ cd /root/custom-da
 ./da-php-build.sh detect
 ```
 
-`check` và `detect` không build PHP.
-
-### 2. Cài package build
+### 2. Cài package và tải source
 
 ```bash
 ./da-php-build.sh setup
-```
-
-### 3. Tải source trước nếu cần
-
-```bash
 ./da-php-build.sh fetch all
 ```
 
-Hoặc chỉ tải các phiên bản PHP:
-
-```bash
-./da-php-build.sh fetch 8.2 8.3 8.4 8.5
-```
-
-### 4. Build PHP
+### 3. Build PHP
 
 Build một phiên bản:
 
 ```bash
-./da-php-build.sh php 8.2
+./da-php-build.sh php 8.4
 ```
 
 Build toàn bộ:
@@ -92,49 +90,13 @@ Build toàn bộ:
 ./da-php-build.sh php all
 ```
 
-Hoặc chỉ định nhiều phiên bản:
+Redis và Imagick được cài mặc định. Có thể tắt bằng:
 
 ```bash
-./da-php-build.sh php 8.2 8.3 8.4 8.5
+INSTALL_EXTENSIONS=0 ./da-php-build.sh php 8.4
 ```
 
-Dependency được tự động build nếu `/opt/dabuild` chưa sẵn sàng. Redis và Imagick được cài mặc định.
-
-### 5. Build lại PHP đã có
-
-Nếu runtime có marker:
-
-```text
-/usr/local/phpXX/.dabuild-managed
-```
-
-chỉ cần chạy lại, không cần xóa runtime cũ:
-
-```bash
-./da-php-build.sh php 8.4
-```
-
-Nếu PHP được cài bởi CustomBuild hoặc công cụ khác và không có marker, cần cho phép script tiếp quản:
-
-```bash
-FORCE=1 ./da-php-build.sh php 8.2
-```
-
-Chỉ dùng `FORCE=1` sau khi đã backup và xác định các website đang sử dụng phiên bản PHP đó.
-
-### 6. Build lại Redis và Imagick
-
-```bash
-./da-php-build.sh extensions 8.2
-```
-
-Hoặc:
-
-```bash
-./da-php-build.sh extensions 8.2 8.3 8.4 8.5
-```
-
-### 7. Tích hợp vào DirectAdmin
+### 4. Tích hợp vào DirectAdmin
 
 Cú pháp:
 
@@ -146,74 +108,48 @@ Ví dụ:
 
 ```bash
 FORCE_SLOT=1 ./da-php-build.sh integrate \
-  8.2 4 demo1 example.com
+  8.4 3 demo1 example.com
 ```
 
-Sau integration:
+Script sẽ kiểm tra domain owner, slot, pool/socket hoặc LSPHP processor, vhost, service và request PHP thật trước khi commit.
 
-```text
-example.com
-  → /usr/local/php82/sockets/demo1.sock
-  → pool [demo1]
-  → PHP worker chạy bằng UID demo1
-```
+> Hãy canary **một phiên bản và một domain** trước khi triển khai diện rộng.
 
-Script sẽ kiểm tra domain owner, slot, pool, socket, quyền sở hữu, vhost, service và request PHP thật trước khi commit.
-
-### 8. Khôi phục transaction bị gián đoạn
-
-Dùng đúng đường dẫn transaction được script thông báo:
+### 5. Build lại extension
 
 ```bash
-./da-php-build.sh recover /duong/dan/transaction/run.XXXXXX
+./da-php-build.sh extensions 8.4
 ```
 
-Không tự xóa transaction chưa hoàn tất.
+### 6. Khôi phục transaction bị gián đoạn
 
-## Các lệnh chính
+```bash
+./da-php-build.sh recover \
+  /duong/dan/transaction/run.XXXXXX
+```
 
-| Lệnh | Chức năng |
-|---|---|
-| `check` | Kiểm tra môi trường, không thay đổi hệ thống |
-| `detect` | Hiển thị webserver và chế độ build |
-| `fetch` | Tải và kiểm tra source |
-| `setup` | Cài package build còn thiếu |
-| `deps` | Build dependency vào `/opt/dabuild` |
-| `php` | Build hoặc rebuild PHP |
-| `extensions` | Build Redis và Imagick |
-| `integrate` | Tích hợp PHP với DirectAdmin |
-| `recover` | Khôi phục transaction bị gián đoạn |
-| `pack` | Đóng gói runtime đã build; `unpack` hiện bị khóa an toàn |
+Không tự xóa hoặc chỉnh sửa transaction chưa hoàn tất.
 
 ## Biến thường dùng
 
 ```bash
-MODE=fpm            # auto, fpm, lsphp hoặc both
-JOBS=4              # số luồng make
-FORCE=1             # tiếp quản runtime không do script tạo
-FORCE_SLOT=1        # cho phép thay release/mode của slot
-RESTART=1           # restart runtime khi có pool hợp lệ
-INSTALL_EXTENSIONS=0 # không cài Redis và Imagick
+MODE=auto              # auto, fpm, lsphp hoặc both
+JOBS=4                 # số luồng make
+FORCE=1                # tiếp quản runtime không do script tạo
+FORCE_SLOT=1           # cho phép thay release/mode của slot
+RESTART=1              # restart runtime khi cấu hình hợp lệ
+INSTALL_EXTENSIONS=0   # không cài Redis và Imagick
 ```
 
-Ví dụ ép chế độ PHP-FPM:
+## Kiểm tra PHP 8.4
 
 ```bash
-MODE=fpm ./da-php-build.sh php 8.2
+/usr/local/php84/bin/php -v
+/usr/local/php84/bin/php -m | grep -E 'redis|imagick'
+/usr/local/php84/bin/lsphp84 -v
 ```
 
-## Kiểm tra sau khi build
-
-Ví dụ PHP 8.2:
-
-```bash
-/usr/local/php82/bin/php -v
-/usr/local/php82/bin/php -m | grep -E 'redis|imagick'
-/usr/local/php82/sbin/php-fpm82 -t
-systemctl status php-fpm82 --no-pager
-```
-
-PHP-FPM chưa có pool DirectAdmin sẽ được giữ inactive. Chạy `integrate` trước khi start service.
+PHP-FPM chưa có pool DirectAdmin sẽ được giữ `inactive/disabled`. Chạy `integrate` trước khi khởi động service.
 
 ## Tác giả
 
